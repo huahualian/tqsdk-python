@@ -6,6 +6,7 @@ import json
 import time
 import requests
 import asyncio
+import aiohttp
 from typing import Union
 from datetime import date, datetime
 from tqsdk.datetime import _get_trading_day_start_time, _get_trading_day_end_time
@@ -32,7 +33,7 @@ class TqBacktest(object):
           始终为 nan, volume 始终为0
 
         * 如果即没有订阅 tick, 也没有订阅k线或 订阅的k线周期大于分钟线, 则 TqBacktest 会 **自动订阅分钟线** 来生成 quote
-        
+
     **注意** ：如果未订阅 quote，模拟交易在下单时会自动为此合约订阅 quote ，根据回测时 quote 的更新规则，如果此合约没有订阅K线或K线周期大于分钟线 **则会自动订阅一个分钟线** 。
 
     模拟交易要求报单价格大于等于对手盘价格才会成交, 例如下买单, 要求价格大于等于卖一价才会成交, 如果不能立即成交则会等到下次行情更新再重新判断。
@@ -56,13 +57,15 @@ class TqBacktest(object):
         if isinstance(start_dt, datetime):
             self._start_dt = int(start_dt.timestamp() * 1e9)
         elif isinstance(start_dt, date):
-            self._start_dt = _get_trading_day_start_time(int(datetime(start_dt.year, start_dt.month, start_dt.day).timestamp()) * 1000000000)
+            self._start_dt = _get_trading_day_start_time(
+                int(datetime(start_dt.year, start_dt.month, start_dt.day).timestamp()) * 1000000000)
         else:
             raise Exception("回测起始时间(start_dt)类型 %s 错误, 请检查 start_dt 数据类型是否填写正确" % (type(start_dt)))
         if isinstance(end_dt, datetime):
             self._end_dt = int(end_dt.timestamp() * 1e9)
         elif isinstance(end_dt, date):
-            self._end_dt = _get_trading_day_end_time(int(datetime(end_dt.year, end_dt.month, end_dt.day).timestamp()) * 1000000000)
+            self._end_dt = _get_trading_day_end_time(
+                int(datetime(end_dt.year, end_dt.month, end_dt.day).timestamp()) * 1000000000)
         else:
             raise Exception("回测结束时间(end_dt)类型 %s 错误, 请检查 end_dt 数据类型是否填写正确" % (type(end_dt)))
         self._current_dt = self._start_dt
@@ -427,6 +430,7 @@ class TqBacktest(object):
 
 class TqReplay(object):
     """天勤复盘类"""
+
     def __init__(self, replay_dt: date):
         """
         除了传统的回测模式以外，TqSdk 提供独具特色的复盘模式，它与回测模式有以下区别
@@ -462,43 +466,44 @@ class TqReplay(object):
         self._logger.warning('开始启动复盘服务器，请稍候。')
 
         session = self._prepare_session()
-        self._session_url = "http://%s:%d/t/rmd/replay/session/%s" % (session["ip"], session["session_port"], session["session"])
-        self._ins_url = "http://%s:%d/t/rmd/replay/session/%s/symbol" % (session["ip"], session["session_port"], session["session"])
+        self._session_url = "http://%s:%d/t/rmd/replay/session/%s" % (
+        session["ip"], session["session_port"], session["session"])
+        self._ins_url = "http://%s:%d/t/rmd/replay/session/%s/symbol" % (
+        session["ip"], session["session_port"], session["session"])
         self._md_url = "ws://%s:%d/t/rmd/front/mobile" % (session["ip"], session["gateway_web_port"])
 
         self._server_status = None
         timeout = time.time() + 30  # 最多等待 30 s
         # 同步等待复盘服务状态 initializing / running
-        while self._server_status is None:
+        while self._server_status is None and timeout > time.time():
             time.sleep(1)
-            response = self._get_server_status()
-            if response and response["status"]:
-                self._server_status = response["status"]
-            if timeout < time.time():
-                break
+            self._server_status = self._get_server_status()
 
-        try_times = 30  # 最多尝试 30 次
+        timeout = time.time() + 30  # 最多等待 30 s
         # 同步等待复盘服务状态 running
-        while self._server_status == "initializing" and try_times > 0:
+        while self._server_status == "initializing" and timeout > time.time():
             time.sleep(1)
-            response = self._get_server_status()
-            try_times -= 1
-            if response and response["status"]:
-                self._server_status = response["status"]
+            self._server_status = self._get_server_status()
 
         if self._server_status == "running":
-            self._set_server_session({"aid": "ratio", "speed": 1})
+            self.session = aiohttp.ClientSession(headers=self._api._base_headers)
+            self._send_chan = tqsdk.api.TqChan(self._api)
+            self._send_chan.send_nowait({"aid": "ratio", "speed": 1})
             return self._ins_url, self._md_url
         else:
             raise Exception("无法创建复盘服务器，请检查复盘日期后重试。")
 
     async def _run(self):
         try:
+            _senddata_task = self._api.create_task(self._senddata_handler())
             while True:
-                self._set_server_session({"aid": "heartbeat"})
+                await self._send_chan.send({"aid": "heartbeat"})
                 await asyncio.sleep(30)
         finally:
-            self._set_server_session({"aid": "terminate"})
+            await self._send_chan.send({"aid": "terminate"})
+            await self.session.close()
+            _senddata_task.cancel()
+            await asyncio.gather(_senddata_task, return_exceptions=True)
 
     def _prepare_session(self):
         create_session_url = "http://replay.api.shinnytech.com/t/rmd/replay/create_session"
@@ -517,16 +522,23 @@ class TqReplay(object):
                                     headers=self._api._base_headers,
                                     timeout=5)
             if response.status_code == 200:
-                return json.loads(response.content)
+                return json.loads(response.content)["status"]
             else:
                 raise Exception("无法创建复盘服务器，请检查复盘日期后重试。")
         except requests.exceptions.ConnectionError as e:
             # 刚开始 _session_url 还不能访问的时候～
             return None
 
-    def _set_server_session(self, data=None):
-        if data is not None:
-            requests.post(self._session_url,
-                          headers=self._api._base_headers,
-                          data=json.dumps(data),
-                          timeout=30)
+    async def _senddata_handler(self):
+        async for data in self._send_chan:
+            await self.session.post(self._session_url, data=json.dumps(data))
+
+    def set_replay_speed(self, speed: float = 10.0) -> None:
+        """
+        调整复盘服务器行情推进速度
+
+        Args:
+            speed (float): 复盘服务器行情推进速度, 默认为 10.0
+
+        """
+        self._send_chan.send_nowait({"aid": "ratio", "speed": speed})
